@@ -17,9 +17,11 @@ class ClientGUI:
         self.kp = generate_keypair()
         self.session_keys = {}  # peer -> key bytes
 
+        # identity (Secure mode)
         self.id_sk = None
         self.id_pk_hex = ""
 
+        # network
         self.ws = None
         self.loop = None
         self.net_thread = None
@@ -31,11 +33,13 @@ class ClientGUI:
         self.password = ""
         self.peer = ""
 
+        # ✅ Secure mode can be toggled at runtime
         self.secure_mode = tk.BooleanVar(value=False)
 
         self._build_ui()
         self._poll_ui_queue()
 
+    # ---------------- UI ----------------
     def _build_ui(self):
         frm = ttk.Frame(self.root, padding=10)
         frm.grid(row=0, column=0, sticky="nsew")
@@ -60,8 +64,13 @@ class ClientGUI:
         self.ent_pass = ttk.Entry(top, show="*")
         self.ent_pass.grid(row=1, column=1, sticky="ew", padx=(5,10), pady=(8,0))
 
-        ttk.Checkbutton(top, text="Secure 模式（数字签名防MITM）", variable=self.secure_mode)\
-            .grid(row=1, column=2, columnspan=2, sticky="w", pady=(8,0))
+        # ✅ Secure toggle with command
+        ttk.Checkbutton(
+            top,
+            text="Secure 模式（数字签名防MITM）",
+            variable=self.secure_mode,
+            command=self.on_toggle_secure
+        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(8, 0))
 
         self.btn_connect = ttk.Button(top, text="连接/注册", command=self.on_connect)
         self.btn_connect.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(8,0))
@@ -107,6 +116,30 @@ class ClientGUI:
     def _set_status(self, s: str):
         self.status.set(s)
 
+    # ------------- Secure toggle -------------
+    def on_toggle_secure(self):
+        # 1) 清空旧会话密钥（避免混用）
+        self.session_keys.clear()
+        self._log(f"[系统] Secure 模式切换：{'ON' if self.secure_mode.get() else 'OFF'}")
+        self._log("[系统] 已清空会话密钥。模式切换需要重新注册：将断开连接。")
+
+        # 2) 如果当前已连接：强制断开 websocket（让网络线程走到 finally->disconnected）
+        if self.connected and self.ws is not None and self.loop is not None:
+            try:
+                asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
+            except Exception as e:
+                self._log(f"[系统] 关闭连接失败：{e}")
+
+        # 3) 立即把 UI 按钮恢复为“可连接”（不用等网络线程回调也能点）
+        #    注意：真正断开后 _handle_ui_event('disconnected') 还会再跑一次，这里不会冲突
+        self.connected = False
+        self.btn_send.configure(state="disabled")
+        self.btn_key.configure(state="disabled")
+        self.btn_load.configure(state="disabled")
+        self.btn_connect.configure(state="normal")
+        self._set_status("未连接（请重新连接/注册）")
+
+    # ------------- UI actions -------------
     def on_connect(self):
         user = self.ent_user.get().strip()
         peer = self.ent_peer.get().strip()
@@ -118,12 +151,13 @@ class ClientGUI:
 
         self.username, self.peer, self.password = user, peer, pwd
 
-        # secure: load identity key
+        # secure: ensure identity key exists
         if self.secure_mode.get():
-            sk, pk_bytes = load_or_create_identity(self.username)
-            self.id_sk = sk
-            self.id_pk_hex = pk_bytes.hex()
-            self._log(f"[身份公钥 Ed25519] fp={fp12(pk_bytes)}")
+            if not self.id_sk or not self.id_pk_hex:
+                sk, pk_bytes = load_or_create_identity(self.username)
+                self.id_sk = sk
+                self.id_pk_hex = pk_bytes.hex()
+                self._log(f"[身份公钥 Ed25519] fp={fp12(pk_bytes)}")
 
         if self.connected:
             messagebox.showinfo("提示", "已连接")
@@ -180,6 +214,7 @@ class ClientGUI:
                 tag = "我->对方" if r["direction"]=="out" else "对方->我"
                 self._log(f"[历史][{tag}] {r['text']}")
 
+    # ---------------- Network thread ----------------
     def _start_network_thread(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
@@ -200,6 +235,11 @@ class ClientGUI:
 
                 # secure mode: attach identity_pub + signature
                 if self.secure_mode.get():
+                    if not self.id_sk or not self.id_pk_hex:
+                        sk, pk_bytes = load_or_create_identity(self.username)
+                        self.id_sk = sk
+                        self.id_pk_hex = pk_bytes.hex()
+
                     sig_hex = sign_binding(self.id_sk, self.username, session_pub_hex)
                     reg["identity_pub"] = self.id_pk_hex
                     reg["sig"] = sig_hex
@@ -242,6 +282,7 @@ class ClientGUI:
             elif typ == "error":
                 self.to_ui_q.put({"ui":"error", "msg": data.get("message","error")})
 
+    # ---------------- UI queue poll ----------------
     def _poll_ui_queue(self):
         try:
             while True:

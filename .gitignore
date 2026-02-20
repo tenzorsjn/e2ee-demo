@@ -210,3 +210,7 @@ __marimo__/
 history/
 identity/
 users.json
+
+
+__pycache__/
+*.pyc
